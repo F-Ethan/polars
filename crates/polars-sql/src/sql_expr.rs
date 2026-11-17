@@ -49,6 +49,7 @@ use crate::literal_folding::{
     decimal_lit, fold_scalar, parse_exact_literal, try_fold_decimal_arithmetic,
 };
 use crate::positional_join::{attach_positional_aliases, extract_positional_joins};
+use crate::sample::{QuerySamples, rewrite_sample_tokens};
 use crate::sql_visitors::expr_references_any_column;
 use crate::subquery::is_correlated_subquery;
 use crate::time_travel::{TableVersions, extract_table_versions};
@@ -66,10 +67,10 @@ pub fn to_sql_interface_err(err: impl Display) -> PolarsError {
     PolarsError::SQLInterface(err.to_string().into())
 }
 
-/// The time travel clauses taken out of a query before it is parsed, which sqlparser does not
-/// parse.
+/// The time travel and `USING SAMPLE` clauses taken out of a query before it is parsed, which
+/// sqlparser does not parse.
 #[must_use]
-pub(crate) struct TakenClauses(TableVersions);
+pub(crate) struct TakenClauses(TableVersions, QuerySamples);
 
 impl TakenClauses {
     /// The statements `parsed` from `sql`, with the taken clauses attached. A `POSITIONAL JOIN`
@@ -81,13 +82,13 @@ impl TakenClauses {
         sql: &str,
         parsed: Result<Vec<Statement>, ParserError>,
     ) -> PolarsResult<Vec<Statement>> {
-        let (mut stmts, versions) = match parsed {
+        let (mut stmts, TakenClauses(versions, samples)) = match parsed {
             Ok(mut stmts) => {
                 attach_positional_aliases(&mut stmts)?;
-                (stmts, self.0)
+                (stmts, self)
             },
             Err(err) => {
-                let (mut tokens, versions) = tokenize(sql)?;
+                let (mut tokens, taken) = tokenize(sql)?;
                 let positional_joins = extract_positional_joins(&mut tokens);
                 if positional_joins.is_empty() {
                     return Err(to_sql_interface_err(err));
@@ -96,15 +97,17 @@ impl TakenClauses {
                     .parse_statements()
                     .map_err(|_| to_sql_interface_err(err))?;
                 positional_joins.attach(&mut stmts)?;
-                (stmts, versions)
+                (stmts, taken)
             },
         };
         versions.attach(&mut stmts)?;
+        samples.attach(&mut stmts)?;
         Ok(stmts)
     }
 
     pub(crate) fn refuse(self) -> PolarsResult<()> {
-        self.0.refuse()
+        self.0.refuse()?;
+        self.1.refuse()
     }
 }
 
@@ -112,18 +115,19 @@ impl TakenClauses {
 /// relation or a column. Time travel clauses (see [`TableVersions`]) are taken out first: the
 /// caller attaches them to its statements or refuses them.
 pub(crate) fn sql_parser(sql: &str) -> PolarsResult<(Parser<'static>, TakenClauses)> {
-    let (tokens, versions) = tokenize(sql)?;
-    Ok((parser_of(tokens), TakenClauses(versions)))
+    let (tokens, taken) = tokenize(sql)?;
+    Ok((parser_of(tokens), taken))
 }
 
-fn tokenize(sql: &str) -> PolarsResult<(Vec<TokenWithSpan>, TableVersions)> {
+fn tokenize(sql: &str) -> PolarsResult<(Vec<TokenWithSpan>, TakenClauses)> {
     let mut tokens = Tokenizer::new(&GenericDialect, sql)
         .with_unescape(ParserOptions::default().unescape)
         .tokenize_with_location()
         .map_err(to_sql_interface_err)?;
     normalize_tokens(&mut tokens);
+    let samples = rewrite_sample_tokens(&mut tokens)?;
     let versions = extract_table_versions(&mut tokens)?;
-    Ok((tokens, versions))
+    Ok((tokens, TakenClauses(versions, samples)))
 }
 
 fn parser_of(tokens: Vec<TokenWithSpan>) -> Parser<'static> {
