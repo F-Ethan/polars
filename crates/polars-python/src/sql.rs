@@ -27,7 +27,7 @@ pub struct PyCatalogRead {
     key: Vec<String>,
 }
 
-#[pyclass(frozen, skip_from_py_object)]
+#[pyclass(frozen)]
 #[repr(transparent)]
 pub struct PySQLContext {
     pub context: RwLock<SQLContext>,
